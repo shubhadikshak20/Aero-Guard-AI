@@ -1,1 +1,373 @@
+from __future__ import annotations
+
+import argparse
+from gettext import install
+import json
+import random
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import pip
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras import Sequential
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+
+
+COLUMN_NAMES = (
+    ["unit_number", "time_cycles"]
+    + [f"setting_{i}" for i in range(1, 4)]
+    + [f"sensor_{i}" for i in range(1, 22)]
+)
+SETTING_COLS = [f"setting_{i}" for i in range(1, 4)]
+SENSOR_COLS = [f"sensor_{i}" for i in range(1, 22)]
+
+
+def set_seeds(seed: int = 42) -> None:
+    """Set Python, NumPy, and TensorFlow seeds for repeatable experiments."""
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
+
+
+def locate_dataset(zip_path: Path | None, data_dir: Path, output_dir: Path) -> Path:
+    """Extract an optional ZIP and return the directory containing FD001 files."""
+    if zip_path is not None:
+        if not zip_path.exists():
+            raise FileNotFoundError(f"ZIP file not found: {zip_path}")
+        extract_dir = output_dir / "CMAPSSData"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(extract_dir)
+        return extract_dir
+
+    if (data_dir / "train_FD001.txt").exists():
+        return data_dir
+    nested = data_dir / "CMAPSSData"
+    if (nested / "train_FD001.txt").exists():
+        return nested
+    raise FileNotFoundError(
+        "Could not find train_FD001.txt. Pass --zip-path or --data-dir."
+    )
+
+
+def load_fd001(data_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
+    """Read the three FD001 files using whitespace separation and no headers."""
+    train_path = data_dir / "train_FD001.txt"
+    test_path = data_dir / "test_FD001.txt"
+    rul_path = data_dir / "RUL_FD001.txt"
+
+    train = pd.read_csv(train_path, sep=r"\s+", header=None, names=COLUMN_NAMES)
+    test = pd.read_csv(test_path, sep=r"\s+", header=None, names=COLUMN_NAMES)
+    true_test_rul = pd.read_csv(rul_path, sep=r"\s+", header=None).iloc[:, 0].to_numpy()
+
+    if train.shape[1] != 26 or test.shape[1] != 26:
+        raise ValueError("Expected 26 columns in each C-MAPSS data file.")
+    if train.isna().any().any() or test.isna().any().any():
+        raise ValueError("Missing values detected in raw data; inspect input files.")
+    if len(true_test_rul) != test["unit_number"].nunique():
+        raise ValueError("RUL_FD001 row count does not match test engine count.")
+    return train, test, true_test_rul
+
+
+def add_training_rul(train: pd.DataFrame, cap: int = 125) -> pd.DataFrame:
+    """Add cycle-level RUL labels, capped at the specified maximum."""
+    result = train.copy()
+    max_cycle = result.groupby("unit_number")["time_cycles"].transform("max")
+    result["RUL"] = (max_cycle - result["time_cycles"]).clip(upper=cap)
+    return result
+
+
+def run_eda(train: pd.DataFrame, output_dir: Path, engines: int = 6) -> None:
+    """Print basic data checks/statistics and save a sensor_11 trend plot."""
+    print("\n--- TRAIN DATA EDA ---")
+    print("Shape:", train.shape)
+    print("Missing values:", int(train.isna().sum().sum()))
+    print("\nDescriptive statistics:\n", train.describe().T.to_string())
+
+    selected = sorted(train["unit_number"].unique())[:engines]
+    plt.figure(figsize=(11, 6))
+    for unit in selected:
+        part = train.loc[train["unit_number"] == unit].sort_values("time_cycles")
+        plt.plot(part["time_cycles"], part["sensor_11"], label=f"Engine {unit}")
+    plt.title("FD001 sensor_11 degradation trends")
+    plt.xlabel("Operating cycle")
+    plt.ylabel("sensor_11")
+    plt.legend()
+    plt.tight_layout()
+    plot_path = output_dir / "sensor_11_degradation.png"
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"\nSaved EDA plot: {plot_path}")
+
+
+def choose_features(
+    train_rows: pd.DataFrame, variance_tolerance: float = 1e-10
+) -> List[str]:
+    """Keep operating settings and sensors that vary in training rows."""
+    candidates = SETTING_COLS + SENSOR_COLS
+    varying = [
+        col for col in candidates
+        if train_rows[col].nunique(dropna=False) > 1
+        and float(train_rows[col].var()) > variance_tolerance
+    ]
+    if not varying:
+        raise ValueError("No varying input features were found.")
+    return varying
+
+
+def make_windows(
+    frame: pd.DataFrame,
+    feature_cols: Sequence[str],
+    window_size: int,
+    label_col: str | None = "RUL",
+    final_window_only: bool = False,
+) -> Tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """
+    Build per-engine sequences; never allow a window to cross engine boundaries.
+
+    For training/validation, one sample is created for every cycle having a
+    complete preceding window. For test data, final_window_only=True returns
+    only the latest window from each engine.
+    """
+    sequences: List[np.ndarray] = []
+    labels: List[float] = []
+    units: List[int] = []
+
+    for unit, group in frame.groupby("unit_number", sort=True):
+        group = group.sort_values("time_cycles")
+        values = group[list(feature_cols)].to_numpy(dtype=np.float32)
+        if len(values) < window_size:
+            continue
+
+        if final_window_only:
+            starts = [len(values) - window_size]
+        else:
+            starts = range(0, len(values) - window_size + 1)
+
+        label_values = (
+            group[label_col].to_numpy(dtype=np.float32)
+            if label_col is not None and label_col in group.columns else None
+        )
+        for start in starts:
+            end = start + window_size
+            sequences.append(values[start:end])
+            units.append(int(unit))
+            if label_values is not None:
+                labels.append(float(label_values[end - 1]))
+
+    if not sequences:
+        raise ValueError(
+            f"No sequences created. Check window_size={window_size} and engine lengths."
+        )
+    X = np.stack(sequences).astype(np.float32)
+    y = np.asarray(labels, dtype=np.float32) if labels else None
+    return X, y, np.asarray(units, dtype=np.int32)
+
+
+def scale_frames(
+    train_rows: pd.DataFrame,
+    val_rows: pd.DataFrame,
+    test_rows: pd.DataFrame,
+    feature_cols: Sequence[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, MinMaxScaler]:
+    """Fit scaling only on training-engine rows; apply unchanged to val/test."""
+    scaler = MinMaxScaler()
+    train_scaled = train_rows.copy()
+    val_scaled = val_rows.copy()
+    test_scaled = test_rows.copy()
+
+    train_scaled.loc[:, feature_cols] = scaler.fit_transform(train_rows[list(feature_cols)])
+    val_scaled.loc[:, feature_cols] = scaler.transform(val_rows[list(feature_cols)])
+    test_scaled.loc[:, feature_cols] = scaler.transform(test_rows[list(feature_cols)])
+    return train_scaled, val_scaled, test_scaled, scaler
+
+
+def build_lstm(window_size: int, n_features: int) -> tf.keras.Model:
+    """Create a regression LSTM that predicts the RUL at the window endpoint."""
+    model = Sequential([
+        Input(shape=(window_size, n_features)),
+        LSTM(96, return_sequences=True),
+        Dropout(0.25),
+        LSTM(48),
+        Dropout(0.20),
+        Dense(32, activation="relu"),
+        Dense(1, activation="linear"),
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="mse",
+        metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
+    )
+    return model
+
+
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """Return RMSE and MAE as ordinary Python floats."""
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    if y_true.shape != y_pred.shape:
+        raise ValueError(f"Metric shape mismatch: {y_true.shape} vs {y_pred.shape}")
+    return {
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train an FD001 LSTM RUL model.")
+    parser.add_argument("--zip-path", type=Path, default=None,
+                        help="Optional path to CMAPSSData.zip.")
+    parser.add_argument("--data-dir", type=Path, default=Path("."),
+                        help="Directory containing FD001 .txt files.")
+    parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    parser.add_argument("--window-size", type=int, default=30)
+    parser.add_argument("--rul-cap", type=int, default=125)
+    parser.add_argument("--validation-size", type=float, default=0.20)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    if args.window_size < 1:
+        raise ValueError("window-size must be >= 1.")
+    if not 0 < args.validation_size < 1:
+        raise ValueError("validation-size must be between 0 and 1.")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seeds(args.seed)
+    data_dir = locate_dataset(args.zip_path, args.data_dir, args.output_dir)
+    train_raw, test_raw, true_test_rul = load_fd001(data_dir)
+
+    run_eda(train_raw, args.output_dir)
+    train_labeled = add_training_rul(train_raw, cap=args.rul_cap)
+
+    # Split by engine ID first: no engine can appear in both partitions.
+    engine_ids = train_labeled["unit_number"].unique()
+    train_units, val_units = train_test_split(
+        engine_ids, test_size=args.validation_size, random_state=args.seed
+    )
+    train_rows = train_labeled[train_labeled["unit_number"].isin(train_units)].copy()
+    val_rows = train_labeled[train_labeled["unit_number"].isin(val_units)].copy()
+
+    feature_cols = choose_features(train_rows)
+    train_scaled, val_scaled, test_scaled, scaler = scale_frames(
+        train_rows, val_rows, test_raw, feature_cols
+    )
+
+    X_train, y_train, _ = make_windows(
+        train_scaled, feature_cols, args.window_size, label_col="RUL"
+    )
+    X_val, y_val, _ = make_windows(
+        val_scaled, feature_cols, args.window_size, label_col="RUL"
+    )
+    assert y_train is not None and y_val is not None
+    if X_train.shape[1:] != (args.window_size, len(feature_cols)):
+        raise ValueError(f"Unexpected training tensor shape: {X_train.shape}")
+    if X_val.shape[1:] != (args.window_size, len(feature_cols)):
+        raise ValueError(f"Unexpected validation tensor shape: {X_val.shape}")
+
+    print("\n--- DATA SPLIT ---")
+    print(f"Training engines ({len(train_units)}): {sorted(train_units.tolist())}")
+    print(f"Validation engines ({len(val_units)}): {sorted(val_units.tolist())}")
+    print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+    print(f"X_val:   {X_val.shape}, y_val:   {y_val.shape}")
+    print(f"Features ({len(feature_cols)}): {feature_cols}")
+
+    model = build_lstm(args.window_size, len(feature_cols))
+    model.summary()
+
+    model_path = args.output_dir / "rul_model.keras"
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True),
+        ModelCheckpoint(
+            filepath=str(model_path), monitor="val_loss",
+            save_best_only=True, verbose=1
+        ),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6),
+    ]
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        callbacks=callbacks,
+        shuffle=True,
+        verbose=1,
+    )
+
+    # Load the best checkpoint, rather than assuming the final epoch was best.
+    model = tf.keras.models.load_model(model_path)
+    val_pred = model.predict(X_val, verbose=0).reshape(-1)
+    val_metrics = regression_metrics(y_val, val_pred)
+
+    # Official test labels correspond to the final observed cycle per test engine.
+    X_test, _, test_units_order = make_windows(
+        test_scaled, feature_cols, args.window_size,
+        label_col=None, final_window_only=True
+    )
+    if len(X_test) != len(true_test_rul):
+        raise ValueError(
+            "Some test engines have fewer rows than the window size, or test/RUL "
+            "engine ordering/count does not match."
+        )
+    test_pred = model.predict(X_test, verbose=0).reshape(-1)
+    test_metrics = regression_metrics(true_test_rul, test_pred)
+
+    # Save a deployment bundle. The Keras model remains a separate native file.
+    bundle = {
+        "model_format": "keras",
+        "model_file": model_path.name,
+        "scaler": scaler,
+        "feature_columns": list(feature_cols),
+        "window_size": args.window_size,
+        "rul_cap": args.rul_cap,
+        "engine_id_column": "unit_number",
+        "cycle_column": "time_cycles",
+    }
+    bundle_path = args.output_dir / "rul_model.joblib"
+    joblib.dump(bundle, bundle_path)
+
+    history_df = pd.DataFrame(history.history)
+    history_df.to_csv(args.output_dir / "training_history.csv", index=False)
+    metrics = {
+        "validation": val_metrics,
+        "official_test": test_metrics,
+        "validation_engines": sorted(int(x) for x in val_units),
+        "training_engines": sorted(int(x) for x in train_units),
+        "features": list(feature_cols),
+        "window_size": args.window_size,
+        "rul_cap": args.rul_cap,
+    }
+    with (args.output_dir / "metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("\n--- FINAL PERFORMANCE ---")
+    print(f"Validation RMSE: {val_metrics['RMSE']:.3f} cycles")
+    print(f"Validation MAE:  {val_metrics['MAE']:.3f} cycles")
+    print(f"Official test RMSE: {test_metrics['RMSE']:.3f} cycles")
+    print(f"Official test MAE:  {test_metrics['MAE']:.3f} cycles")
+    print("\nFinal feature list:")
+    for name in feature_cols:
+        print(" -", name)
+    print("\nSaved artifacts:")
+    print(" -", model_path)
+    print(" -", bundle_path)
+    print(" -", args.output_dir / "metrics.json")
+    print(" -", args.output_dir / "training_history.csv")
+    print(" -", args.output_dir / "sensor_11_degradation.png")
+
+
+if __name__ == "__main__":
+    main()
 
